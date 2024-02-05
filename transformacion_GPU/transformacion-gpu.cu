@@ -25,7 +25,6 @@ __global__ void computeC_kernel_shared(float *A, float *B, float *C, int N, int 
 
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int tid = threadIdx.x; // Identificador del hilo dentro del bloque
-    int blockStart = blockIdx.x * blockDim.x; // Inicio del bloque en el array global
 
     // Cargar los datos de A y B en la memoria compartida
     if (i < N) {
@@ -35,13 +34,13 @@ __global__ void computeC_kernel_shared(float *A, float *B, float *C, int N, int 
         s_A[tid] = 0.0f;
         s_B[tid] = 0.0f;
     }
-    __syncthreads();
-
+    __syncthreads(); 
+   
     // Realizar el cálculo de C[i] usando la memoria compartida
     if (i < N) {
         float cValue = 0.0;
-        for (int j = 0; j < Bsize; j++) {
-            if (blockStart + j < N) {
+        for (int j = 0; j < blockDim.x; j++) { // Debes iterar sobre todo el bloque, no solo hasta Bsize
+            if (blockIdx.x * blockDim.x + j < N) { // Asegúrate de no salirte de los límites del array
                 float a = s_A[j];
                 float b = s_B[j];
                 float a_times_i = a * i;
@@ -52,7 +51,7 @@ __global__ void computeC_kernel_shared(float *A, float *B, float *C, int N, int 
                 }
             }
         }
-        C[i] = cValue;
+        C[i] = cValue;   
     }
 }
 
@@ -85,9 +84,10 @@ __global__ void computeD_kernel(float *C, float *D, int N, int Bsize) {
     __syncthreads();
 
     // Realizar la reducción en la memoria compartida
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
+    for (unsigned int s = 1; s < blockDim.x; s *= 2) {
+        int index = 2 * s * tid;
+        if (index < blockDim.x) {
+            sdata[index] += sdata[index + s];
         }
         __syncthreads();
     }
@@ -170,21 +170,20 @@ int main(int argc, char *argv[]) {
     const int N = Bsize * NBlocks;
 
     // Allocate arrays on host
-    float *A = new float[N];
-    float *B = new float[N];
-    float *C = new float[N];
-    float *D = new float[NBlocks];
+    float *A = (float*)malloc(N * sizeof(float));
+    float *B = (float*)malloc(N * sizeof(float));
+    float *C = (float*)malloc(N * sizeof(float));
+    float *D = (float*)malloc(NBlocks * sizeof(float));
 
     initializeArrays(A, B, N);
 
     float *A_device, *B_device, *C_device, *D_device, *maxVal_device; 
  
-
     dim3 dimBlock(Bsize_addition);
     dim3 dimGrid(ceil((float) N / dimBlock.x));
     dim3 threadsPerBlock(Bsize_minimum, 1);
     dim3 numBlocks(ceil((float) N / threadsPerBlock.x), 1);
-    int sharedMemSize = threadsPerBlock.x * sizeof(float);
+    int sharedMemSize = 2 * threadsPerBlock.x * sizeof(float);
 
     // Allocate memory on the GPU
     cudaMalloc(&A_device, N * sizeof(float));
@@ -197,15 +196,19 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(A_device, A, N * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(B_device, B, N * sizeof(float), cudaMemcpyHostToDevice);
 
+    // Inicializa D_device a 0
+    cudaMemset(D_device, 0, NBlocks * sizeof(float));
+
     // Time measurement
     double t1 = clock();
-    cudaDeviceSynchronize();
 
     // computeC_kernel
     if(shared==1){
         computeC_kernel_shared<<<numBlocks, threadsPerBlock, sharedMemSize>>>(A_device, B_device, C_device, N, Bsize);
+        cudaDeviceSynchronize();
     }else{
         computeC_kernel_noShared<<<numBlocks, threadsPerBlock>>>(A_device, B_device, C_device, N);
+        cudaDeviceSynchronize();
     }
 
     // Verificar errores de CUDA después de las operaciones de CUDA
@@ -218,6 +221,7 @@ int main(int argc, char *argv[]) {
 
     // reduceMax_kernel
     reduceMax_kernel<<<numBlocks, threadsPerBlock, sharedMemSize>>>(C_device, maxVal_device, N);
+    cudaDeviceSynchronize();
     cudaError = cudaGetLastError();
     if (cudaError != cudaSuccess) {
         std::cerr << "Error en reduceMax_kernel: " << cudaGetErrorString(cudaError) << std::endl;
@@ -226,6 +230,7 @@ int main(int argc, char *argv[]) {
 
     // computeD_kernel
     computeD_kernel<<<NBlocks, Bsize, sharedMemSize>>>(C_device, D_device, N, Bsize);
+    cudaDeviceSynchronize();
     cudaError = cudaGetLastError();
     if (cudaError != cudaSuccess) {
         std::cerr << "Error en computeD_kernel: " << cudaGetErrorString(cudaError) << std::endl;
@@ -234,8 +239,11 @@ int main(int argc, char *argv[]) {
 
     // Copiar los resultados de C y D al host
     cudaMemcpy(C, C_device, N * sizeof(float), cudaMemcpyDeviceToHost);
+    for (int i = N; i > (N-10); i--) {
+        cout << "C[" << i << "] = " << C[i] << std::endl;
+    }
     cudaMemcpy(D, D_device, NBlocks * sizeof(float), cudaMemcpyDeviceToHost);
-
+    
     // Liberar memoria de la GPU
     cudaFree(A_device);
     cudaFree(B_device);
@@ -245,16 +253,15 @@ int main(int argc, char *argv[]) {
 
     // Calcular máximo en el host ya que se copió C_device a C
     float mx = computeMax(C, N);
-    cudaDeviceSynchronize();
     double t2 = (clock() - t1) / CLOCKS_PER_SEC;
 
     printResults(D, mx, NBlocks, t2, N, Bsize, shared);
 
     // Liberar la memoria del host
-    delete[] A;
-    delete[] B;
-    delete[] C;
-    delete[] D;
+    free(A);
+    free(B);
+    free(C);
+    free(D);
 
     return 0;
 }
